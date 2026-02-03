@@ -38,3 +38,10 @@ mmseqs_tmp_*/
 *.m8
 output/
 results/
+
+# Logs
+logs/
+*.log
+
+# SLURM output files
+slurm-*.out

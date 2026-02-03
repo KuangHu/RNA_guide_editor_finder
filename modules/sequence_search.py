@@ -11,6 +11,7 @@ This module handles:
 import subprocess
 import tempfile
 import os
+import time
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
@@ -105,7 +106,7 @@ class SequenceSearcher:
         tmp_dir: Optional[str] = None
     ) -> str:
         """
-        Run MMseqs2 easy-search against the database.
+        Run MMseqs2 search against the database using manual workflow (faster than easy-search).
 
         Args:
             query_fasta: Path to query FASTA file
@@ -124,30 +125,73 @@ class SequenceSearcher:
         if tmp_dir is None:
             tmp_dir = tempfile.mkdtemp(prefix='mmseqs_tmp_')
 
-        # Build MMseqs2 command
-        cmd = [
-            'mmseqs', 'easy-search',
+        # Create database paths
+        query_db = os.path.join(tmp_dir, 'queryDB')
+        result_db = os.path.join(tmp_dir, 'resultDB')
+
+        print("Step 2a: Creating query database...")
+        # Step 1: Create query database
+        cmd_createdb = [
+            'mmseqs', 'createdb',
             query_fasta,
+            query_db
+        ]
+
+        try:
+            subprocess.run(cmd_createdb, capture_output=True, text=True, check=True)
+            print("Query database created successfully")
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"MMseqs2 createdb failed: {e.stderr}")
+
+        print("Step 2b: Running MMseqs2 search (optimized)...")
+        # Step 2: Run search
+        cmd_search = [
+            'mmseqs', 'search',
+            query_db,
             str(self.database_path),
-            output_file,
+            result_db,
             tmp_dir,
             '-s', str(self.sensitivity),
             '--min-seq-id', str(self.min_seq_identity),
-            '--threads', str(self.threads)
+            '--threads', str(self.threads),
+            '--search-type', '3',  # Nucleotide search
+            '--alignment-mode', '2',  # Local alignment (best for conserved domains)
+            '-c', '0.15',  # 15% coverage threshold
+            '--cov-mode', '2',  # Query coverage (15% of query must align)
+            '-v', '3'  # Verbose output for progress tracking
         ]
 
-        print(f"Running MMseqs2 search: {' '.join(cmd)}")
+        print(f"Running: mmseqs search with sensitivity={self.sensitivity}, threads={self.threads}")
 
         try:
             result = subprocess.run(
-                cmd,
+                cmd_search,
                 capture_output=True,
                 text=True,
                 check=True
             )
             print("MMseqs2 search completed successfully")
+            if result.stdout:
+                print(result.stdout)
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f"MMseqs2 search failed: {e.stderr}")
+
+        print("Step 2c: Converting results to m8 format...")
+        # Step 3: Convert results to m8 format
+        cmd_convertalis = [
+            'mmseqs', 'convertalis',
+            query_db,
+            str(self.database_path),
+            result_db,
+            output_file,
+            '--format-mode', '0'  # BLAST-tab format
+        ]
+
+        try:
+            subprocess.run(cmd_convertalis, capture_output=True, text=True, check=True)
+            print(f"Results converted to {output_file}")
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"MMseqs2 convertalis failed: {e.stderr}")
 
         return output_file
 
@@ -374,33 +418,53 @@ class SequenceSearcher:
             Deduplicated list of SearchHit objects with sequences
         """
         temp_files = []
+        start_time = time.time()
 
         try:
             # Step 1: Create query FASTA
+            print("\n" + "="*60)
             print("Step 1: Creating query FASTA...")
+            step_start = time.time()
             query_fasta = self.create_query_fasta(sequence, query_id)
             temp_files.append(query_fasta)
+            print(f"✓ Completed in {time.time() - step_start:.2f} seconds")
 
             # Step 2: Run MMseqs2 search
-            print("Step 2: Running MMseqs2 search...")
+            print("\n" + "="*60)
+            print("Step 2: Running MMseqs2 search (manual workflow)...")
+            step_start = time.time()
             results_file = self.run_mmseqs_search(query_fasta)
             temp_files.append(results_file)
+            print(f"✓ MMseqs2 search completed in {time.time() - step_start:.2f} seconds")
 
             # Step 3: Parse results
+            print("\n" + "="*60)
             print("Step 3: Parsing results...")
+            step_start = time.time()
             hits = self.parse_mmseqs_results(results_file)
+            print(f"✓ Completed in {time.time() - step_start:.2f} seconds")
 
             if not hits:
                 print("No hits found")
                 return []
 
             # Step 4: Retrieve sequences
+            print("\n" + "="*60)
             print("Step 4: Retrieving sequences from FNA files...")
+            step_start = time.time()
             hits = self.retrieve_sequences_from_fna(hits, context_bp)
+            print(f"✓ Completed in {time.time() - step_start:.2f} seconds")
 
             # Step 5: Deduplicate
+            print("\n" + "="*60)
             print("Step 5: Deduplicating results...")
+            step_start = time.time()
             deduplicated = self.deduplicate_hits(hits, dedup_threshold)
+            print(f"✓ Completed in {time.time() - step_start:.2f} seconds")
+
+            print("\n" + "="*60)
+            print(f"TOTAL TIME: {time.time() - start_time:.2f} seconds ({(time.time() - start_time)/60:.2f} minutes)")
+            print("="*60 + "\n")
 
             return deduplicated
 
@@ -444,8 +508,13 @@ def write_results_fasta(
 
 
 # Default paths for GTDB database
-DEFAULT_DATABASE_PATH = "/groups/rubin/projects/kuang/db/gtdb_mmseq_db"
-DEFAULT_FNA_FOLDER = "/groups/rubin/projects/kuang/db/GTDB/"
+# Full database (107k genomes, 322 GB)
+# DEFAULT_DATABASE_PATH = "/groups/rubin/projects/kuang/db/gtdb_mmseq_db"
+# DEFAULT_FNA_FOLDER = "/groups/rubin/projects/kuang/db/GTDB/"
+
+# Test database (5k genomes, 16 GB) - much faster for testing!
+DEFAULT_DATABASE_PATH = "/groups/rubin/projects/kuang/db/gtdb_test_5k/gtdb_5k_db"
+DEFAULT_FNA_FOLDER = "/groups/rubin/projects/kuang/db/gtdb_test_5k/"
 
 
 # Example usage
@@ -454,11 +523,13 @@ if __name__ == "__main__":
     test_sequence = "tatccctccagtgcagagaaaatcggccagttttctctgcctgcagtccgcatgccgtatcgggccttgggttctaacctgttgcgtagatttatgcagcggactgcctttctcccaaagtgataaaccggacagtatcatggaccggttttcccggtaatccgtatttgcaaggttggtttcact"
 
     # Initialize searcher with default paths
+    # Using manual search workflow (faster) + low sensitivity for quick testing
     searcher = SequenceSearcher(
         database_path=DEFAULT_DATABASE_PATH,
         fna_folder=DEFAULT_FNA_FOLDER,
         min_seq_identity=0.8,
-        sensitivity=7.5
+        sensitivity=3.0,  # Lower sensitivity for faster testing
+        threads=48  # Use all available CPUs
     )
 
     # Run search
