@@ -16,6 +16,7 @@ from .alignment_filter import (
     create_default_pipeline,
     create_strict_pipeline,
     create_relaxed_pipeline,
+    create_legacy_pipeline,
 )
 from .region_extractor import (
     RegionExtractor,

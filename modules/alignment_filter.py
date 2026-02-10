@@ -180,6 +180,94 @@ def calculate_dinucleotide_ratio(sequence: str) -> float:
     return max_ratio
 
 
+def calculate_ungapped_evalue(alignment_length: int, mismatches: int,
+                              search_space: int) -> float:
+    """Calculate E-value for an ungapped alignment using exact combinatorial probability.
+
+    Formula (computed in log-space to avoid overflow):
+        E = G * C(n,k) * 3^k / 4^n
+
+    where G = search_space, n = alignment_length, k = mismatches.
+    """
+    n = alignment_length
+    k = mismatches
+    if k > n or k < 0 or n <= 0:
+        return float('inf')
+
+    # log(C(n,k)) + k*log(3) - n*log(4) + log(G)
+    log_comb = math.lgamma(n + 1) - math.lgamma(k + 1) - math.lgamma(n - k + 1)
+    log_e = math.log(search_space) + log_comb + k * math.log(3) - n * math.log(4)
+    return math.exp(log_e)
+
+
+def calculate_gapped_evalue(score: float, query_len: int, target_len: int,
+                            K: float, lam: float) -> float:
+    """Calculate E-value for a gapped alignment using Karlin-Altschul statistics.
+
+    Formula: E = K * m * n * exp(-lambda * S)
+    """
+    if score <= 0:
+        return float('inf')
+    log_e = math.log(K) + math.log(query_len) + math.log(target_len) - lam * score
+    return math.exp(log_e)
+
+
+def compute_lambda_for_scoring(match_score: int = 2, mismatch_penalty: int = -1,
+                               max_iter: int = 100, tol: float = 1e-10) -> float:
+    """Compute Karlin-Altschul lambda using Newton-Raphson.
+
+    Solves: 0.25*exp(match*lam) + 0.75*exp(mismatch*lam) - 1 = 0
+    assuming equal base frequencies (p=0.25 each), so match prob = 0.25,
+    mismatch prob = 0.75.
+
+    For match=2, mismatch=-1: lambda ~ ln(2) ~ 0.693
+    """
+    s = match_score
+    r = mismatch_penalty
+    lam = 0.5  # initial guess
+
+    for _ in range(max_iter):
+        f = 0.25 * math.exp(s * lam) + 0.75 * math.exp(r * lam) - 1.0
+        fp = 0.25 * s * math.exp(s * lam) + 0.75 * r * math.exp(r * lam)
+        if abs(fp) < 1e-15:
+            break
+        lam_new = lam - f / fp
+        if lam_new <= 0:
+            lam_new = lam / 2.0
+        if abs(lam_new - lam) < tol:
+            lam = lam_new
+            break
+        lam = lam_new
+
+    return lam
+
+
+def evalue_to_pvalue(evalue: float) -> float:
+    """Convert E-value to P-value: P = 1 - exp(-E)"""
+    if evalue >= 700:
+        return 1.0
+    return 1.0 - math.exp(-evalue)
+
+
+def count_gap_opens(alignment_string: str) -> int:
+    """Count gap-open events (non-gap -> gap transitions) in an alignment string.
+
+    Gaps are represented as spaces ' ' in the alignment string.
+    """
+    if not alignment_string:
+        return 0
+    opens = 0
+    in_gap = False
+    for ch in alignment_string:
+        if ch == ' ':
+            if not in_gap:
+                opens += 1
+                in_gap = True
+        else:
+            in_gap = False
+    return opens
+
+
 def is_boundary_artifact(alignment: Dict, transposon_start: int, transposon_end: int,
                         boundary_distance: int = 10) -> bool:
     """Check if alignment is a boundary annotation artifact"""
@@ -324,6 +412,120 @@ class Filters:
 
         return passed, reason, metrics
 
+    @staticmethod
+    def statistical_significance_filter(sequence: str, params: Dict,
+                                        alignment: Dict = None,
+                                        transposon_data: Dict = None) -> Tuple[bool, str, Dict]:
+        """Statistical significance filter using E-value calculations.
+
+        Determines alignment confidence based on how unlikely the match
+        is to occur by chance, accounting for mismatches, gaps, and
+        search space size.
+
+        The search space is computed from the full sequence lengths:
+            G = (query_length - n + 1) * (target_length - n + 1)
+        where query_length = len(flanking region), target_length = len(non-coding region),
+        and n = alignment_length. These lengths are read from the alignment dict
+        ('query_length' and 'target_length' fields). Falls back to params['search_space']
+        if not provided.
+        """
+        e_value_reject = params.get('e_value_reject', 0.01)
+        e_value_low = params.get('e_value_low', 1e-3)
+        e_value_high = params.get('e_value_high', 1e-6)
+        match_score = params.get('match_score', 2)
+        mismatch_penalty = params.get('mismatch_penalty', -1)
+        gap_open_penalty = params.get('gap_open_penalty', -3)
+        gap_extend_penalty = params.get('gap_extend_penalty', -1)
+        karlin_K = params.get('karlin_K', 0.1)
+        karlin_lambda = params.get('karlin_lambda', None)
+
+        # Get alignment info
+        mismatches = 0
+        gaps = 0
+        alignment_string = ''
+        alignment_length = len(sequence)
+        query_length = None
+        target_length = None
+
+        if alignment is not None:
+            mismatches = alignment.get('mismatches', 0)
+            gaps = alignment.get('gaps', 0)
+            alignment_string = alignment.get('alignment_string', '')
+            query_length = alignment.get('query_length', None)
+            target_length = alignment.get('target_length', None)
+
+        # Compute search space from full sequence lengths if available
+        if query_length is not None and target_length is not None:
+            n = alignment_length
+            search_space = max(1, query_length - n + 1) * max(1, target_length - n + 1)
+        else:
+            # Fallback to explicit search_space param
+            search_space = params.get('search_space', 500)
+            if transposon_data is not None:
+                search_space = transposon_data.get('search_space', search_space)
+
+        is_gapped = gaps > 0
+
+        if is_gapped:
+            # Gapped path: compute raw score, then Karlin-Altschul E-value
+            gap_opens = count_gap_opens(alignment_string)
+            gap_extensions = gaps - gap_opens
+            matches = alignment_length - mismatches - gaps
+            raw_score = (matches * match_score +
+                         mismatches * mismatch_penalty +
+                         gap_opens * gap_open_penalty +
+                         gap_extensions * gap_extend_penalty)
+
+            if karlin_lambda is None:
+                karlin_lambda = compute_lambda_for_scoring(match_score, mismatch_penalty)
+
+            # For gapped Karlin-Altschul, use full sequence lengths directly
+            ka_query = query_length if query_length is not None else alignment_length
+            ka_target = target_length if target_length is not None else search_space
+
+            evalue = calculate_gapped_evalue(raw_score, ka_query, ka_target,
+                                             karlin_K, karlin_lambda)
+            metrics = {
+                'e_value': evalue,
+                'p_value': evalue_to_pvalue(evalue),
+                'raw_score': raw_score,
+                'gap_opens': gap_opens,
+                'search_space': search_space,
+                'is_gapped': True,
+            }
+        else:
+            # Ungapped path: exact combinatorial E-value
+            evalue = calculate_ungapped_evalue(alignment_length, mismatches, search_space)
+            metrics = {
+                'e_value': evalue,
+                'p_value': evalue_to_pvalue(evalue),
+                'alignment_length': alignment_length,
+                'mismatches': mismatches,
+                'search_space': search_space,
+                'is_gapped': False,
+            }
+
+        # Assign confidence based on E-value thresholds
+        if evalue > e_value_reject:
+            confidence = 'rejected'
+            reason = f"E_VALUE_TOO_HIGH: E={evalue:.2e} > {e_value_reject:.2e}"
+            passed = False
+        elif evalue > e_value_low:
+            confidence = 'low'
+            reason = f"LOW_CONFIDENCE_EVALUE: E={evalue:.2e} in ({e_value_low:.2e}, {e_value_reject:.2e}]"
+            passed = True
+        elif evalue > e_value_high:
+            confidence = 'low'
+            reason = ""
+            passed = True
+        else:
+            confidence = 'high'
+            reason = ""
+            passed = True
+
+        metrics['confidence'] = confidence
+        return passed, reason, metrics
+
 
 # ============================================
 # Main Filter Engine
@@ -342,6 +544,7 @@ class FilterEngine:
         'length_hard_cutoff': Filters.length_hard_cutoff_filter,
         'length_confidence': Filters.length_confidence_filter,
         'boundary_artifact': Filters.boundary_artifact_filter,
+        'statistical_significance': Filters.statistical_significance_filter,
     }
 
     def __init__(self, pipeline: FilterPipeline):
@@ -391,7 +594,7 @@ class FilterEngine:
                 # Execute filter
                 try:
                     # Some filters need additional context
-                    if filter_config.name in ['boundary_artifact']:
+                    if filter_config.name in ['boundary_artifact', 'statistical_significance']:
                         passed, reason, metrics = filter_func(
                             sequence,
                             filter_config.params,
@@ -415,8 +618,8 @@ class FilterEngine:
                     if passed:
                         result['passed_filters'].append(filter_config.name)
 
-                        # Special handling for confidence filter
-                        if filter_config.name == 'length_confidence' and 'confidence' in metrics:
+                        # Special handling for confidence filters
+                        if filter_config.name in ('length_confidence', 'statistical_significance') and 'confidence' in metrics:
                             result['confidence'] = metrics['confidence']
                     else:
                         result['pass'] = False
@@ -526,7 +729,114 @@ def create_default_pipeline() -> FilterPipeline:
         description="Filter sequences with excessive dinucleotide repeats"
     )
 
-    # Level 2: Length filters
+    # Level 2: Statistical significance filter
+    pipeline.add_filter(
+        'statistical_significance',
+        FilterLevel.LENGTH,
+        enabled=True,
+        params={
+            'search_space': 500,
+            'e_value_reject': 0.01,
+            'e_value_low': 1e-3,
+            'e_value_high': 1e-6,
+            'match_score': 2,
+            'mismatch_penalty': -1,
+            'gap_open_penalty': -3,
+            'gap_extend_penalty': -1,
+            'karlin_K': 0.1,
+            'karlin_lambda': None,
+        },
+        description="E-value based statistical significance filter"
+    )
+
+    # Level 3: Topology filters
+    pipeline.add_filter(
+        'boundary_artifact',
+        FilterLevel.TOPOLOGY,
+        enabled=True,
+        params={'boundary_distance': 10},
+        description="Filter boundary annotation artifacts"
+    )
+
+    return pipeline
+
+
+def create_strict_pipeline() -> FilterPipeline:
+    """Create strict filter pipeline"""
+    pipeline = create_default_pipeline()
+
+    # Stricter parameters
+    pipeline.update_params('at_content', {'max_at_percent': 70.0})
+    pipeline.update_params('entropy', {'min_entropy': 1.8})
+    pipeline.update_params('homopolymer', {'max_homopolymer_length': 4})
+    pipeline.update_params('statistical_significance', {
+        'e_value_reject': 1e-3,
+        'e_value_low': 1e-6,
+        'e_value_high': 1e-9,
+    })
+
+    return pipeline
+
+
+def create_relaxed_pipeline() -> FilterPipeline:
+    """Create relaxed filter pipeline"""
+    pipeline = create_default_pipeline()
+
+    # More relaxed parameters
+    pipeline.update_params('at_content', {'max_at_percent': 80.0})
+    pipeline.update_params('entropy', {'min_entropy': 1.2})
+    pipeline.update_params('homopolymer', {'max_homopolymer_length': 6})
+    pipeline.update_params('statistical_significance', {
+        'e_value_reject': 0.05,
+        'e_value_low': 0.01,
+        'e_value_high': 1e-3,
+    })
+
+    return pipeline
+
+
+def create_legacy_pipeline() -> FilterPipeline:
+    """Create legacy filter pipeline with original length-based filters.
+
+    Provides backwards compatibility with the pre-statistical-significance
+    filtering approach using hard length cutoffs and confidence zones.
+    """
+    pipeline = FilterPipeline()
+
+    # Level 1: Composition filters
+    pipeline.add_filter(
+        'at_content',
+        FilterLevel.COMPOSITION,
+        enabled=True,
+        params={'max_at_percent': 75.0},
+        description="Filter sequences with AT content > 75%"
+    )
+
+    pipeline.add_filter(
+        'entropy',
+        FilterLevel.COMPOSITION,
+        enabled=True,
+        params={'min_entropy': 1.5},
+        description="Filter low-complexity sequences (Shannon entropy < 1.5)"
+    )
+
+    pipeline.add_filter(
+        'homopolymer',
+        FilterLevel.COMPOSITION,
+        enabled=True,
+        params={'max_homopolymer_length': 5},
+        description="Filter sequences with homopolymers > 5bp"
+    )
+
+    pipeline.add_filter(
+        'dinucleotide',
+        FilterLevel.COMPOSITION,
+        enabled=True,
+        params={'max_dinucleotide_ratio': 0.8},
+        description="Filter sequences with excessive dinucleotide repeats"
+    )
+
+    # Level 2: Length filters (original)
     pipeline.add_filter(
         'length_hard_cutoff',
         FilterLevel.LENGTH,
@@ -551,33 +861,6 @@ def create_default_pipeline() -> FilterPipeline:
         params={'boundary_distance': 10},
         description="Filter boundary annotation artifacts"
     )
-
-    return pipeline
-
-
-def create_strict_pipeline() -> FilterPipeline:
-    """Create strict filter pipeline"""
-    pipeline = create_default_pipeline()
-
-    # Stricter parameters
-    pipeline.update_params('at_content', {'max_at_percent': 70.0})
-    pipeline.update_params('entropy', {'min_entropy': 1.8})
-    pipeline.update_params('homopolymer', {'max_homopolymer_length': 4})
-    pipeline.update_params('length_hard_cutoff', {'min_length': 12})
-    pipeline.update_params('length_confidence', {'low_confidence_min': 12, 'high_confidence_min': 16})
-
-    return pipeline
-
-
-def create_relaxed_pipeline() -> FilterPipeline:
-    """Create relaxed filter pipeline"""
-    pipeline = create_default_pipeline()
-
-    # More relaxed parameters
-    pipeline.update_params('at_content', {'max_at_percent': 80.0})
-    pipeline.update_params('entropy', {'min_entropy': 1.2})
-    pipeline.update_params('homopolymer', {'max_homopolymer_length': 6})
-    pipeline.update_params('length_hard_cutoff', {'min_length': 8})
 
     return pipeline
 
@@ -623,22 +906,33 @@ if __name__ == "__main__":
     print(f"By confidence: {results['by_confidence']}")
     print(f"Failed by filter: {results['failed_by_filter']}")
 
-    # Example 2: Custom configuration
+    # Example 2: Statistical significance E-values
     print("\n" + "=" * 60)
-    print("Example 2: Custom configuration - AT content and length only")
+    print("Example 2: Statistical significance - E-value comparison")
     print("=" * 60)
 
-    custom_pipeline = FilterPipeline()
-    custom_pipeline.add_filter('at_content', FilterLevel.COMPOSITION,
-                               params={'max_at_percent': 80.0})
-    custom_pipeline.add_filter('length_hard_cutoff', FilterLevel.LENGTH,
-                               params={'min_length': 10})
+    test_cases = [
+        ("8bp, 0mm", 8, 0),
+        ("9bp, 0mm", 9, 0),
+        ("9bp, 1mm", 9, 1),
+        ("12bp, 0mm", 12, 0),
+        ("15bp, 0mm", 15, 0),
+        ("17bp, 1mm", 17, 1),
+        ("20bp, 2mm", 20, 2),
+    ]
 
-    custom_engine = FilterEngine(custom_pipeline)
-    custom_results = custom_engine.filter_all_alignments(sample_data)
-    print(f"Total: {custom_results['total_alignments']}")
-    print(f"Passed: {custom_results['passed']}")
-    print(f"Failed: {custom_results['failed']}")
+    print(f"{'Alignment':<12} {'E-value (G=500)':<20} {'Confidence'}")
+    print("-" * 50)
+    for label, length, mm in test_cases:
+        ev = calculate_ungapped_evalue(length, mm, 500)
+        # Determine confidence using default thresholds
+        if ev > 0.01:
+            conf = "rejected"
+        elif ev > 1e-6:
+            conf = "low"
+        else:
+            conf = "high"
+        print(f"{label:<12} {ev:<20.2e} {conf}")
 
     # Example 3: Dynamic parameter adjustment
     print("\n" + "=" * 60)
@@ -651,9 +945,9 @@ if __name__ == "__main__":
     adjustable_pipeline.disable_filter('dinucleotide')
     adjustable_pipeline.disable_filter('boundary_artifact')
 
-    # Adjust parameters
+    # Adjust E-value thresholds
     adjustable_pipeline.update_params('at_content', {'max_at_percent': 85.0})
-    adjustable_pipeline.update_params('length_hard_cutoff', {'min_length': 8})
+    adjustable_pipeline.update_params('statistical_significance', {'e_value_reject': 0.05})
 
     adjustable_engine = FilterEngine(adjustable_pipeline)
     adjustable_results = adjustable_engine.filter_all_alignments(sample_data)
