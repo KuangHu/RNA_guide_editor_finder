@@ -29,6 +29,12 @@ from .short_alignment_finder import (
     find_alignments_between_sequences,
     extend_alignment_with_gaps,
 )
+from .is_element_processor import (
+    ISElementProcessor,
+    process_is_element,
+    process_is_elements_file,
+    load_is_elements,
+)
 # Re-export utility functions from utils.parsers for convenience
 from utils.parsers import (
     reverse_complement,
