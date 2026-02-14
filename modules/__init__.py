@@ -35,6 +35,8 @@ from .is_element_processor import (
     process_is_elements_file,
     load_is_elements,
 )
+from .is_element_visualizer import ISElementVisualizer
+from .is_element_genbank import ISElementGenBank
 # Re-export utility functions from utils.parsers for convenience
 from utils.parsers import (
     reverse_complement,
